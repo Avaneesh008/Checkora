@@ -1,77 +1,126 @@
-### 🐞 Describe the Bug
+### ✨ Feature Request — Real Elo Rating System with AI Difficulty Mapping
 
-The AI engine (PvE mode) occasionally returns an **invalid or null best move** when the board reaches certain edge-case positions (e.g., only kings remain, or all legal moves are forced). Instead of gracefully handling the terminal/drawn state, the backend raises an unhandled exception and returns a 500 error, freezing the game for the user.
+### 📋 Problem Statement
 
-### 🔍 Steps to Reproduce
-
-1. Start a **Play vs AI** game from `/play/`
-2. Set difficulty to **Hard**
-3. Reduce the position to a near-endgame state with very few pieces (≤ 4 pieces on board)
-4. Maneuver into a position where only kings remain (e.g., trade all material)
-5. Observe the game freeze — no move is made by the AI and the board becomes unresponsive
-
-**Example sequence:**
-
-1. Go to `http://127.0.0.1:8000/play/`
-2. Select **Play vs AI → Hard** and start the game as White
-3. Trade all pieces until only the two kings remain on the board
-4. Wait for the AI to respond — the spinner appears but never resolves
-5. Open browser DevTools (F12 → Network) — the `/api/move/` POST call returns HTTP **500**
-
-### ✅ Expected vs 🚫 Actual Behavior
-
-- **Expected:** When no legal moves exist or the game is in a drawn/stalemate state, the backend should detect the terminal condition via the `STATUS` command and return a proper game-over response (e.g., `{ "status": "draw", "reason": "insufficient_material" }`) without crashing.
-- **Actual:** The `BESTMOVE` engine command is called on a terminal position. The C++ engine (or Python fallback) returns an empty/null response, which the Django view in `game/views.py` fails to handle — raising an unhandled `IndexError` or `ValueError`, resulting in a 500 response and a frozen UI.
-
-### 📸 Evidence
-
-- [x] Network log (F12 → Network tab)
-
-```
-POST /api/move/  →  500 Internal Server Error
-Response: {"error": "invalid literal for int() with base 10: ''"}
-```
-
-- [x] Server traceback (Django terminal):
+The current rating system in `game/rating_service.py` uses a **flat, fixed point system** that is not meaningful or fair:
 
 ```python
-# Traceback (most recent call last):
-#   File ".../game/views.py", line XX, in api_move
-#     best = engine.get_best_move(board_str, castling, turn, ep_row, ep_col, depth)
-#   File ".../game/engine.py", line XX, in get_best_move
-#     row, col = int(parts[0]), int(parts[1])   # ← parts is [''] when engine returns empty
-# ValueError: invalid literal for int() with base 10: ''
+def calculate_rating_change(result):
+    if result == "win":   return +20
+    if result == "draw":  return +5
+    if result == "loss":  return -10
 ```
 
-- [ ] Screenshots
+This means:
+- A **1200-rated** player beating an **800-rated** opponent gains the same `+20` as beating a **2000-rated** opponent.
+- Ratings **inflate over time** (wins always give +20, losses only −10) and do not converge to a player's true skill level.
+- In PvE (AI) mode, there is **no opponent rating** at all — every AI win/loss applies the same static delta regardless of difficulty.
+
+The result is a rating number that has no statistical meaning and fails to motivate players.
+
+### 💡 Proposed Solution
+
+Implement the **Elo rating formula** as used in standard chess:
+
+```
+Expected Score  = 1 / (1 + 10 ^ ((opponent_rating - player_rating) / 400))
+Rating Change   = K × (actual_score - expected_score)
+```
+
+Where:
+- `actual_score` = 1 (win), 0.5 (draw), 0 (loss)
+- `K` = K-factor (suggested: **32** for all players to keep it responsive)
+
+#### AI Difficulty → Opponent Rating Mapping
+
+| Difficulty | AI "Rating" |
+|------------|-------------|
+| Easy       | 800         |
+| Medium     | 1200        |
+| Hard       | 1600        |
+
+#### Example Calculations
+
+| Player Rating | AI Difficulty | Result | Δ Rating |
+|---------------|---------------|--------|----------|
+| 1200          | Easy (800)    | Win    | +7       |
+| 1200          | Easy (800)    | Loss   | −25      |
+| 1200          | Medium (1200) | Win    | +16      |
+| 1200          | Hard (1600)   | Win    | +25      |
+| 1200          | Hard (1600)   | Loss   | −7       |
+
+This makes a win against **Hard AI much more rewarding** and a loss against **Easy AI much more penalizing**.
+
+### 🗂️ Files to Modify
+
+- `game/rating_service.py` — Replace `calculate_rating_change(result)` with
+  `calculate_rating_change(result, player_rating, opponent_rating, k=32)`
+- `game/views.py` — Update all callers of `update_player_rating()` to pass
+  `opponent_rating` (derived from AI difficulty in PvE, or opponent's actual rating in PvP)
+- `game/views.py` → `update_player_rating()` — Accept and forward `opponent_rating`
+- `game/views.py` → `ai_move()`, `make_move()`, `resign_game()`, `offer_draw()` — Resolve AI opponent rating from `request.session.get('difficulty')`
+
+### 🔧 Implementation Direction
+
+**Step 1 — Update `rating_service.py`:**
+```python
+def calculate_rating_change(result, player_rating, opponent_rating, k=32):
+    """Compute Elo rating change."""
+    score = {"win": 1.0, "draw": 0.5, "loss": 0.0}[result]
+    expected = 1 / (1 + 10 ** ((opponent_rating - player_rating) / 400))
+    change = round(k * (score - expected))
+    return change
+```
+
+**Step 2 — Resolve opponent rating in `update_player_rating()`:**
+```python
+AI_RATINGS = {"easy": 800, "medium": 1200, "hard": 1600}
+
+def update_player_rating(user, winner, player_color, mode="pvp", difficulty="medium"):
+    rating, _ = PlayerRating.objects.get_or_create(user=user)
+    opponent_rating = AI_RATINGS.get(difficulty, 1200) if mode == "ai" else 1200
+    result = "win" if winner == player_color else ("draw" if winner == "draw" else "loss")
+    change = calculate_rating_change(result, rating.rating, opponent_rating)
+    ...
+```
+
+**Step 3 — Pass difficulty from session into callers:**
+```python
+# In views.py wherever update_player_rating is called:
+difficulty = request.session.get("difficulty", "medium")
+update_player_rating(user, winner, player_color, mode=game.mode, difficulty=difficulty)
+```
+
+### ✅ Acceptance Criteria
+
+- [ ] `calculate_rating_change()` uses the Elo formula, not flat points
+- [ ] AI games use `easy=800 / medium=1200 / hard=1600` as opponent rating
+- [ ] PvP games use a fixed opponent rating of `1200` (or fetch actual opponent's rating if user-vs-user is ever implemented)
+- [ ] Rating floor stays at `100` (already enforced via `max(100, ...)`)
+- [ ] All existing callers of `update_player_rating()` updated to pass `mode` and `difficulty`
+- [ ] Unit tests updated / added in `game/tests.py` for the new Elo formula
 
 ### 💻 Environment
 
-- **Device:** Windows PC
-- **OS:** Windows 11
-- **Browser:** Chrome 126+
-- **Python:** 3.12
-- **Engine:** C++ (compiled via `g++ -O2 -std=c++17`) / Python fallback
+- **Affects:** All platforms (local dev + Vercel production)
+- **Related files:**
+  - `game/rating_service.py` — Core formula
+  - `game/views.py` — `update_player_rating()`, `record_game_result()`, `ai_move()`, `resign_game()`, `offer_draw()`
+  - `game/tests.py` — Rating tests
 
 ### 📦 Additional Context
 
-- Does this happen consistently? **Yes** — reproducible every time the position reaches insufficient material (K vs K).
-- Related files:
-  - `game/engine.py` — `get_best_move()` method — does not guard against empty engine stdout
-  - `game/views.py` — `api_move()` view — does not call `STATUS` before calling `BESTMOVE`
-  - `game/engine/main.cpp` — `BESTMOVE` handler — returns empty line on terminal positions instead of a sentinel value
-  - `game/engine/main.py` — Python fallback — same issue
-- **Fix direction:**
-  1. In `game/views.py`, call the `STATUS` command first; if the result is `checkmate`, `stalemate`, or `draw`, return the appropriate JSON without calling `BESTMOVE`.
-  2. In `game/engine.py`, add a null/empty guard around the engine's stdout response to `BESTMOVE` and raise a descriptive `EngineError` instead of a raw `ValueError`.
-  3. In `game/engine/main.cpp` (and `main.py`), return a sentinel string like `NONE` when no legal moves are available so the caller can distinguish "no move" from a genuine error.
-- Workarounds (if any): None — the game is completely frozen once this state is reached; the user must refresh.
+- Does this break existing ratings? **Yes** — existing stored ratings were computed with the flat system and will be inconsistent after this change. Consider a one-time migration to reset all ratings to `1200` (the standard Elo starting point) when this is merged.
+- Related models: `game/models.py` → `PlayerRating`, `RatingHistory` — no schema changes needed.
+- The `RatingHistory` model already stores `old_rating`, `new_rating`, and `rating_change` — it will automatically reflect the new Elo deltas.
+- Workarounds (if any): None — the flat system must be replaced entirely for ratings to be meaningful.
 
 ```python
-# Proposed guard in game/engine.py → get_best_move():
-response = self._send_command(f"BESTMOVE {board} ...")
-if not response or response.strip() == "NONE":
-    return None   # caller should treat None as game-over / no move available
+# Quick sanity check — expected outputs for the new formula:
+# player=1200, opponent=800  (Easy AI), win  → +7  ✅
+# player=1200, opponent=1200 (Medium AI), win → +16 ✅
+# player=1200, opponent=1600 (Hard AI),  win  → +25 ✅
+# player=1200, opponent=1600 (Hard AI),  loss → -7  ✅
 ```
 
 <!-- Thank you for helping improve Checkora! ♟️ -->
