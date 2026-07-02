@@ -1,0 +1,77 @@
+### 🐞 Describe the Bug
+
+The AI engine (PvE mode) occasionally returns an **invalid or null best move** when the board reaches certain edge-case positions (e.g., only kings remain, or all legal moves are forced). Instead of gracefully handling the terminal/drawn state, the backend raises an unhandled exception and returns a 500 error, freezing the game for the user.
+
+### 🔍 Steps to Reproduce
+
+1. Start a **Play vs AI** game from `/play/`
+2. Set difficulty to **Hard**
+3. Reduce the position to a near-endgame state with very few pieces (≤ 4 pieces on board)
+4. Maneuver into a position where only kings remain (e.g., trade all material)
+5. Observe the game freeze — no move is made by the AI and the board becomes unresponsive
+
+**Example sequence:**
+
+1. Go to `http://127.0.0.1:8000/play/`
+2. Select **Play vs AI → Hard** and start the game as White
+3. Trade all pieces until only the two kings remain on the board
+4. Wait for the AI to respond — the spinner appears but never resolves
+5. Open browser DevTools (F12 → Network) — the `/api/move/` POST call returns HTTP **500**
+
+### ✅ Expected vs 🚫 Actual Behavior
+
+- **Expected:** When no legal moves exist or the game is in a drawn/stalemate state, the backend should detect the terminal condition via the `STATUS` command and return a proper game-over response (e.g., `{ "status": "draw", "reason": "insufficient_material" }`) without crashing.
+- **Actual:** The `BESTMOVE` engine command is called on a terminal position. The C++ engine (or Python fallback) returns an empty/null response, which the Django view in `game/views.py` fails to handle — raising an unhandled `IndexError` or `ValueError`, resulting in a 500 response and a frozen UI.
+
+### 📸 Evidence
+
+- [x] Network log (F12 → Network tab)
+
+```
+POST /api/move/  →  500 Internal Server Error
+Response: {"error": "invalid literal for int() with base 10: ''"}
+```
+
+- [x] Server traceback (Django terminal):
+
+```python
+# Traceback (most recent call last):
+#   File ".../game/views.py", line XX, in api_move
+#     best = engine.get_best_move(board_str, castling, turn, ep_row, ep_col, depth)
+#   File ".../game/engine.py", line XX, in get_best_move
+#     row, col = int(parts[0]), int(parts[1])   # ← parts is [''] when engine returns empty
+# ValueError: invalid literal for int() with base 10: ''
+```
+
+- [ ] Screenshots
+
+### 💻 Environment
+
+- **Device:** Windows PC
+- **OS:** Windows 11
+- **Browser:** Chrome 126+
+- **Python:** 3.12
+- **Engine:** C++ (compiled via `g++ -O2 -std=c++17`) / Python fallback
+
+### 📦 Additional Context
+
+- Does this happen consistently? **Yes** — reproducible every time the position reaches insufficient material (K vs K).
+- Related files:
+  - `game/engine.py` — `get_best_move()` method — does not guard against empty engine stdout
+  - `game/views.py` — `api_move()` view — does not call `STATUS` before calling `BESTMOVE`
+  - `game/engine/main.cpp` — `BESTMOVE` handler — returns empty line on terminal positions instead of a sentinel value
+  - `game/engine/main.py` — Python fallback — same issue
+- **Fix direction:**
+  1. In `game/views.py`, call the `STATUS` command first; if the result is `checkmate`, `stalemate`, or `draw`, return the appropriate JSON without calling `BESTMOVE`.
+  2. In `game/engine.py`, add a null/empty guard around the engine's stdout response to `BESTMOVE` and raise a descriptive `EngineError` instead of a raw `ValueError`.
+  3. In `game/engine/main.cpp` (and `main.py`), return a sentinel string like `NONE` when no legal moves are available so the caller can distinguish "no move" from a genuine error.
+- Workarounds (if any): None — the game is completely frozen once this state is reached; the user must refresh.
+
+```python
+# Proposed guard in game/engine.py → get_best_move():
+response = self._send_command(f"BESTMOVE {board} ...")
+if not response or response.strip() == "NONE":
+    return None   # caller should treat None as game-over / no move available
+```
+
+<!-- Thank you for helping improve Checkora! ♟️ -->
