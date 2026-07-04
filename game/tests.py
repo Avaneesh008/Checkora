@@ -3490,3 +3490,106 @@ class AvatarViewTest(TestCase):
         self.assertEqual(response.status_code, 200)
         # Should stay on avatar page with an error message
         self.assertTemplateUsed(response, 'game/avatar.html')
+
+
+class EloRatingSystemTest(TestCase):
+    """Tests for the Elo rating calculations and PlayerRating updates."""
+
+    def setUp(self):
+        super().setUp()
+        self.user = User.objects.create_user(
+            username='rating_player',
+            password='TestPass123!',
+            email='rating@example.com'
+        )
+
+    def test_calculate_rating_change_elo_formula(self):
+        from game.rating_service import calculate_rating_change
+
+        # player=1200, opponent=800, win
+        self.assertEqual(calculate_rating_change("win", 1200, 800), 3)
+        # player=1200, opponent=800, loss
+        self.assertEqual(calculate_rating_change("loss", 1200, 800), -29)
+        # player=1200, opponent=1200, win
+        self.assertEqual(calculate_rating_change("win", 1200, 1200), 16)
+        # player=1200, opponent=1600, win
+        self.assertEqual(calculate_rating_change("win", 1200, 1600), 29)
+        # player=1200, opponent=1600, loss
+        self.assertEqual(calculate_rating_change("loss", 1200, 1600), -3)
+
+        # Invalid result raises ValueError
+        with self.assertRaises(ValueError):
+            calculate_rating_change("invalid_result", 1200, 1200)
+
+    def test_update_player_rating_pve_easy(self):
+        from game.views import update_player_rating
+        from game.models import PlayerRating
+
+        # Base rating starts at 1200
+        rating, _ = PlayerRating.objects.get_or_create(user=self.user)
+        self.assertEqual(rating.rating, 1200)
+
+        # Win against Easy AI (800) -> should gain +3 points
+        update_player_rating(self.user, "white", "white", mode="ai", difficulty="easy")
+        rating.refresh_from_db()
+        self.assertEqual(rating.rating, 1203)
+
+    def test_update_player_rating_pve_hard(self):
+        from game.views import update_player_rating
+        from game.models import PlayerRating
+
+        # Base rating starts at 1200
+        rating, _ = PlayerRating.objects.get_or_create(user=self.user)
+        self.assertEqual(rating.rating, 1200)
+
+        # Win against Hard AI (1600) -> should gain +29 points
+        update_player_rating(self.user, "white", "white", mode="ai", difficulty="hard")
+        rating.refresh_from_db()
+        self.assertEqual(rating.rating, 1229)
+
+    def test_update_player_rating_pvp(self):
+        from game.views import update_player_rating
+        from game.models import PlayerRating
+
+        # Base rating starts at 1200
+        rating, _ = PlayerRating.objects.get_or_create(user=self.user)
+        self.assertEqual(rating.rating, 1200)
+
+        # Win against PvP opponent (defaults to 1200 rating) -> should gain +16 points
+        update_player_rating(self.user, "white", "white", mode="pvp")
+        rating.refresh_from_db()
+        self.assertEqual(rating.rating, 1216)
+
+    def test_rating_floor(self):
+        from game.views import update_player_rating
+        from game.models import PlayerRating
+
+        rating, _ = PlayerRating.objects.get_or_create(user=self.user)
+        # Set player rating to floor boundary
+        rating.rating = 110
+        rating.save()
+
+        # Mock calculate_rating_change to return -50
+        with mock.patch('game.views.calculate_rating_change', return_value=-50):
+            update_player_rating(self.user, "black", "white", mode="ai", difficulty="easy")
+        
+        rating.refresh_from_db()
+        self.assertEqual(rating.rating, 100)
+
+
+    def test_record_game_result_resolves_difficulty_from_session(self):
+        from game.views import record_game_result
+        from game.models import PlayerRating
+
+        factory = RequestFactory()
+        request = factory.post('/dummy/')
+        request.user = self.user
+        request.session = {'difficulty': 'hard'}
+
+        # A win in an AI game
+        record_game_result(request, mode='ai', winner='white', reason='checkmate', player_color='white', moves=[])
+
+        rating = PlayerRating.objects.get(user=self.user)
+        # Should resolve as a win against Hard AI (1600) starting at 1200 rating -> +29 points -> 1229
+        self.assertEqual(rating.rating, 1229)
+

@@ -121,12 +121,16 @@ def index(request):
     return render(request, 'game/board.html')
 
 
-def update_player_rating(user, winner, player_color):
+AI_RATINGS = {"easy": 800, "medium": 1200, "hard": 1600}
+
+
+def update_player_rating(user, winner, player_color, mode="pvp", difficulty="medium"):
     rating, _ = PlayerRating.objects.get_or_create(
         user=user
     )
 
     old_rating = rating.rating
+    opponent_rating = AI_RATINGS.get((difficulty or "medium").lower(), 1200) if mode == "ai" else 1200
 
     if winner == "draw":
         result = "draw"
@@ -137,7 +141,7 @@ def update_player_rating(user, winner, player_color):
     else:
         result = "loss"
 
-    change = calculate_rating_change(result)
+    change = calculate_rating_change(result, old_rating, opponent_rating)
 
     new_rating = max(
         100,
@@ -192,10 +196,13 @@ def record_game_result(request, mode, winner, reason, player_color='white', move
     result.save()
 
     if user:
+        difficulty = request.session.get("difficulty", "medium")
         update_player_rating(
             user,
             winner,
-            player_color
+            player_color,
+            mode=mode,
+            difficulty=difficulty
         )
         
         check_game_achievements(user)
